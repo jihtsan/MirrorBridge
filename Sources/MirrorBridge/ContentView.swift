@@ -45,6 +45,18 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 7) {
                 toolRow(name: "adb", path: model.adbPath)
                 toolRow(name: "scrcpy", path: model.scrcpyPath)
+                HStack(spacing: 10) {
+                    Text(model.toolStatus.message)
+                        .font(.caption)
+                        .foregroundStyle(model.toolStatus == .ready ? Color.secondary : Color.red)
+                    Spacer()
+                    Button {
+                        model.refreshNow()
+                    } label: {
+                        Label("重新检查", systemImage: "arrow.clockwise")
+                    }
+                    .disabled(model.isBusy)
+                }
                 Text("首版使用外部 scrcpy 镜像窗口；发布版将把经过验证的工具放进 App Bundle。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -97,8 +109,10 @@ struct ContentView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(!model.canMirror)
-                    Button("停止") {
+                    Button {
                         model.stopMirror()
+                    } label: {
+                        Label("停止", systemImage: "stop.fill")
                     }
                     .disabled(!model.isMirroring)
                 }
@@ -135,8 +149,10 @@ struct ContentView: View {
                     Text("诊断日志")
                         .font(.headline)
                     Spacer()
-                    Button("清空") {
+                    Button {
                         model.clearLogs()
+                    } label: {
+                        Label("清空", systemImage: "trash")
                     }
                 }
 
@@ -200,6 +216,8 @@ struct ContentView: View {
         case .discovered, .connected: return .blue
         case .pairing, .connecting: return .orange
         case .mirroring: return .green
+        case .stopping: return .orange
+        case .stopUnconfirmed: return .red
         case .error: return .red
         }
     }

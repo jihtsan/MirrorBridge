@@ -17,6 +17,11 @@ let package = Package(
         .executableTarget(
             name: "MirrorBridge",
             path: "Sources/MirrorBridge"
+        ),
+        .testTarget(
+            name: "MirrorBridgeTests",
+            dependencies: ["MirrorBridge"],
+            path: "Tests/MirrorBridgeTests"
         )
     ],
     swiftLanguageVersions: [.v5]
