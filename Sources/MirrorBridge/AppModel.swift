@@ -55,12 +55,15 @@ final class AppModel: ObservableObject {
     private let stopConfirmationTimeout: TimeInterval
     private var refreshTask: Task<Void, Never>?
     private var stopConfirmationTask: Task<Void, Never>?
+    private var stopObservationTask: Task<Void, Never>?
     private var activeOperationTask: Task<Void, Never>?
     private var activeOperationID: UInt64?
     private var cancelledOperationID: UInt64?
     private var operationID: UInt64 = 0
+    private var observationID: UInt64 = 0
     private var activeMirrorSession: UInt64?
     private var mirrorStopRequestedSession: UInt64?
+    private var stopObservationID: UInt64?
     private var latestRefreshID: UInt64 = 0
     private var adbServerReady = false
     private var refreshInFlight = false
@@ -139,6 +142,7 @@ final class AppModel: ObservableObject {
     deinit {
         refreshTask?.cancel()
         stopConfirmationTask?.cancel()
+        stopObservationTask?.cancel()
         activeOperationTask?.cancel()
         if activeMirrorSession != nil, mirrorStopRequestedSession == nil {
             scrcpy?.stop()
@@ -200,11 +204,11 @@ final class AppModel: ObservableObject {
             if result.succeeded {
                 self.state = .waiting
                 self.statusMessage = "配对成功。请保持无线调试开启，等待发现连接服务。"
+                _ = await self.refreshDevices(recheckEnvironment: false)
             } else {
                 self.state = .error
                 self.statusMessage = "配对失败，请检查地址、配对码和局域网连接后重试。"
             }
-            _ = await self.refreshDevices(recheckEnvironment: false)
             self.finishOperation(operation)
         }
     }
@@ -306,6 +310,37 @@ final class AppModel: ObservableObject {
         statusMessage = "正在取消当前 ADB 操作，等待退出确认…"
     }
 
+    func retryStopConfirmation() {
+        guard state == .stopUnconfirmed,
+              let session = activeMirrorSession,
+              mirrorStopRequestedSession == session,
+              stopObservationID == nil,
+              let scrcpy else { return }
+
+        observationID &+= 1
+        let observation = observationID
+        stopObservationID = observation
+        statusMessage = "正在检查镜像窗口退出状态…"
+
+        stopObservationTask = Task { [weak self, scrcpy] in
+            let result = await scrcpy.observeExit()
+            guard let self,
+                  self.state == .stopUnconfirmed,
+                  self.activeMirrorSession == session,
+                  self.mirrorStopRequestedSession == session,
+                  self.stopObservationID == observation else { return }
+
+            self.stopObservationID = nil
+            self.stopObservationTask = nil
+            switch result {
+            case .exited:
+                self.handleMirrorExit(session: session, status: 0)
+            case .stillRunning:
+                self.statusMessage = "镜像窗口仍在运行，退出尚未确认；检查不会终止它。"
+            }
+        }
+    }
+
     func clearLogs() {
         logText = ""
     }
@@ -333,7 +368,7 @@ final class AppModel: ObservableObject {
             refreshEnvironment()
         }
 
-        guard toolStatus == .ready, let adb else {
+        guard let adb, toolStatus != .missingADB, toolStatus != .missingBoth else {
             isBusy = false
             return false
         }
@@ -516,6 +551,9 @@ final class AppModel: ObservableObject {
         let wasStopping = mirrorStopRequestedSession == session
         stopConfirmationTask?.cancel()
         stopConfirmationTask = nil
+        stopObservationTask?.cancel()
+        stopObservationTask = nil
+        stopObservationID = nil
         activeMirrorSession = nil
         mirrorStopRequestedSession = nil
         isMirroring = false

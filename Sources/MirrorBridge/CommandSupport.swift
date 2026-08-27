@@ -11,6 +11,11 @@ struct CommandResult: Sendable, Equatable {
     var succeeded: Bool { exitCode == 0 }
 }
 
+enum ScrcpyExitObservation: Sendable, Equatable {
+    case exited
+    case stillRunning
+}
+
 enum ToolLocatorError: LocalizedError {
     case missing(String)
 
@@ -542,6 +547,7 @@ protocol ScrcpyClient: AnyObject, Sendable {
     ) throws
 
     func stop()
+    func observeExit() async -> ScrcpyExitObservation
 }
 
 enum ScrcpyServiceError: LocalizedError {
@@ -660,5 +666,15 @@ final class ScrcpyService: ScrcpyClient, @unchecked Sendable {
             kill(currentProcess.processIdentifier, SIGKILL)
             #endif
         }
+    }
+
+    func observeExit() async -> ScrcpyExitObservation {
+        processHasExited() ? .exited : .stillRunning
+    }
+
+    private func processHasExited() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return process == nil
     }
 }

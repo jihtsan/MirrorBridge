@@ -68,8 +68,12 @@ final class FakeScrcpy: ScrcpyClient, @unchecked Sendable {
     var startError: Error?
     var startCalls: [String] = []
     var stopCalls = 0
+    var observeExitResult: ScrcpyExitObservation = .stillRunning
+    var waitForObservation = false
+    private(set) var observeExitCalls = 0
     private(set) var startCallDetails: [StartCall] = []
     private var exitedSessions = Set<Int>()
+    private var pendingObservation: CheckedContinuation<ScrcpyExitObservation, Never>?
 
     var isRunning: Bool {
         startCallDetails.indices.contains { !exitedSessions.contains($0) }
@@ -89,6 +93,21 @@ final class FakeScrcpy: ScrcpyClient, @unchecked Sendable {
 
     func stop() {
         stopCalls += 1
+    }
+
+    func observeExit() async -> ScrcpyExitObservation {
+        observeExitCalls += 1
+        if waitForObservation {
+            return await withCheckedContinuation { continuation in
+                pendingObservation = continuation
+            }
+        }
+        return observeExitResult
+    }
+
+    func finishPendingObservation(with result: ScrcpyExitObservation) {
+        pendingObservation?.resume(returning: result)
+        pendingObservation = nil
     }
 
     func triggerExit(at index: Int, status: Int32) {
@@ -159,6 +178,28 @@ final class MirrorBridgeTests: XCTestCase {
         XCTAssertEqual(model.selectedEndpoint, "192.168.1.7:41231")
         XCTAssertEqual(model.state, .discovered)
         XCTAssertEqual(locator.calls, 2)
+    }
+
+    func testMissingScrcpyStillStartsADBAndAllowsPairing() async {
+        let adb = FakeADB()
+        configureDiscovery(adb)
+        let model = AppModel(adb: adb, scrcpy: nil, startsRefreshLoop: false)
+
+        model.refreshNow()
+
+        let discovered = await eventually {
+            adb.startServerCalls == 1 && adb.discoverCalls == 1 && model.devices.count == 1
+        }
+        XCTAssertTrue(discovered)
+        XCTAssertEqual(model.toolStatus, .missingScrcpy)
+
+        model.pairingAddress = "192.168.1.7:37001"
+        model.pairingCode = "pairing-code"
+        model.pair()
+
+        let paired = await eventually { adb.pairCalls.count == 1 && !model.isBusy }
+        XCTAssertTrue(paired)
+        XCTAssertFalse(model.canMirror)
     }
 
     func testToolRefreshRecoversFromMissingADBWithoutRestarting() async {
@@ -358,6 +399,32 @@ final class MirrorBridgeTests: XCTestCase {
         XCTAssertEqual(adb.pairCalls.count, 1)
     }
 
+    func testPairingFailurePreservesTheFailureStateInsteadOfBeingOverwrittenByDiscovery() async {
+        let adb = FakeADB()
+        configureDiscovery(adb)
+        adb.pairResult = CommandResult(
+            exitCode: 1,
+            stdout: "",
+            stderr: "pair failed"
+        )
+        let model = AppModel(adb: adb, scrcpy: FakeScrcpy(), startsRefreshLoop: false)
+
+        model.refreshNow()
+        let discovered = await eventually { model.devices.count == 1 }
+        XCTAssertTrue(discovered)
+        let discoveryCallsBeforePair = adb.discoverCalls
+
+        model.pairingAddress = "192.168.1.7:37001"
+        model.pairingCode = "pairing-code"
+        model.pair()
+
+        let failed = await eventually { model.state == .error && !model.isBusy }
+        XCTAssertTrue(failed)
+        XCTAssertEqual(adb.discoverCalls, discoveryCallsBeforePair)
+        XCTAssertEqual(model.devices.count, 1)
+        XCTAssertTrue(model.statusMessage.contains("配对失败"))
+    }
+
     func testSuccessfulFlowStopsAndReconnectsWithoutPairingAgain() async {
         let adb = FakeADB()
         let scrcpy = FakeScrcpy()
@@ -471,6 +538,52 @@ final class MirrorBridgeTests: XCTestCase {
         XCTAssertTrue(recovered)
     }
 
+    func testUnconfirmedStopCanRetryExitObservationWithoutSendingAnotherStop() async {
+        let adb = FakeADB()
+        let scrcpy = FakeScrcpy()
+        configureDiscovery(adb)
+        let model = AppModel(
+            adb: adb,
+            scrcpy: scrcpy,
+            startsRefreshLoop: false,
+            stopConfirmationTimeout: 0.01
+        )
+
+        model.refreshNow()
+        let discovered = await eventually { model.devices.count == 1 }
+        XCTAssertTrue(discovered)
+        model.connectAndMirror()
+        let mirroring = await eventually { model.state == .mirroring }
+        XCTAssertTrue(mirroring)
+
+        model.stopMirror()
+        let unconfirmed = await eventually { model.state == .stopUnconfirmed }
+        XCTAssertTrue(unconfirmed)
+
+        scrcpy.waitForObservation = true
+        model.retryStopConfirmation()
+
+        let observing = await eventually { scrcpy.observeExitCalls == 1 }
+        XCTAssertTrue(observing)
+        model.retryStopConfirmation()
+        await Task.yield()
+        XCTAssertEqual(scrcpy.observeExitCalls, 1)
+
+        scrcpy.finishPendingObservation(with: .stillRunning)
+        let observed = await eventually { model.statusMessage.contains("仍在运行") }
+        XCTAssertTrue(observed)
+        XCTAssertEqual(scrcpy.stopCalls, 1)
+        XCTAssertTrue(model.isMirroring)
+
+        scrcpy.waitForObservation = false
+        scrcpy.observeExitResult = .exited
+        model.retryStopConfirmation()
+
+        let recovered = await eventually { model.state == .connected && !model.isMirroring }
+        XCTAssertTrue(recovered)
+        XCTAssertEqual(scrcpy.stopCalls, 1)
+    }
+
     func testPairingCodeIsSentOnStdinAndNeverAppearsInProcessArgumentsOrResult() async throws {
         let pairingCode = "pairing-\(UUID().uuidString)"
         let script = try makeExecutableScript(
@@ -562,6 +675,8 @@ final class MirrorBridgeTests: XCTestCase {
         )
 
         XCTAssertTrue(service.isRunning)
+        let runningObservation = await service.observeExit()
+        XCTAssertEqual(runningObservation, .stillRunning)
         XCTAssertThrowsError(try service.start(
             endpoint: "127.0.0.1:41232",
             onOutput: { _ in },
@@ -572,6 +687,8 @@ final class MirrorBridgeTests: XCTestCase {
 
         service.stop()
         await fulfillment(of: [exited], timeout: 2)
+        let exitedObservation = await service.observeExit()
+        XCTAssertEqual(exitedObservation, .exited)
     }
 
     func testConnectFailureReleasesBusyStateAndCanRetry() async {

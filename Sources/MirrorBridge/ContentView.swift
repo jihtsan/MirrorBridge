@@ -109,12 +109,21 @@ struct ContentView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(!model.canMirror)
-                    Button {
-                        model.stopMirror()
-                    } label: {
-                        Label("停止", systemImage: "stop.fill")
+                    if model.state == .stopUnconfirmed {
+                        Button {
+                            model.retryStopConfirmation()
+                        } label: {
+                            Label("检查退出状态", systemImage: "arrow.clockwise")
+                        }
+                        .disabled(!model.isMirroring)
+                    } else {
+                        Button {
+                            model.stopMirror()
+                        } label: {
+                            Label("停止", systemImage: "stop.fill")
+                        }
+                        .disabled(!model.isMirroring)
                     }
-                    .disabled(!model.isMirroring)
                 }
             }
             .padding(.vertical, 4)
