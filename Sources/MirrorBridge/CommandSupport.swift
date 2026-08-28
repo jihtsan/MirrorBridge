@@ -432,6 +432,127 @@ protocol ADBClient: AnyObject, Sendable {
     func discover() async -> DiscoveryResult
 }
 
+protocol BonjourClient: AnyObject, Sendable {
+    func discover() async -> [DiscoveredDevice]
+}
+
+final class BonjourService: BonjourClient, @unchecked Sendable {
+    private enum Timeout {
+        static let browse: TimeInterval = 2
+        static let resolution: TimeInterval = 2
+    }
+
+    private static let serviceType = "_adb-tls-connect._tcp"
+    private let runner: CommandRunner?
+
+    init(
+        executableURL: URL? = nil,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) {
+        let executableURL = executableURL ?? Self.resolveExecutable(environment: environment)
+        self.runner = executableURL.map {
+            CommandRunner(executableURL: $0, environment: environment)
+        }
+    }
+
+    func discover() async -> [DiscoveredDevice] {
+        guard let runner else { return [] }
+
+        // dns-sd streams browse and resolve events, so the bounded commands intentionally
+        // return their partial stdout when the command deadline is reached.
+        let browse = await runner.run(
+            ["-B", Self.serviceType, "local"],
+            timeout: Timeout.browse
+        )
+        let serviceNames = Self.parseBrowse(browse.stdout)
+        guard !serviceNames.isEmpty else { return [] }
+
+        return await withTaskGroup(of: DiscoveredDevice?.self, returning: [DiscoveredDevice].self) { group in
+            for serviceName in serviceNames {
+                group.addTask { [runner] in
+                    let resolution = await runner.run(
+                        ["-L", serviceName, Self.serviceType, "local"],
+                        timeout: Timeout.resolution
+                    )
+                    guard let endpoint = Self.parseResolution(resolution.stdout) else {
+                        return nil
+                    }
+                    return DiscoveredDevice(endpoint: endpoint, serviceName: serviceName)
+                }
+            }
+
+            var devices: [DiscoveredDevice] = []
+            for await device in group {
+                if let device {
+                    devices.append(device)
+                }
+            }
+
+            var seen = Set<String>()
+            return devices
+                .filter { seen.insert($0.endpoint).inserted }
+                .sorted {
+                    $0.endpoint.localizedStandardCompare($1.endpoint) == .orderedAscending
+                }
+        }
+    }
+
+    static func parseBrowse(_ output: String) -> [String] {
+        var names: [String] = []
+        var seen = Set<String>()
+
+        for line in output.split(whereSeparator: \.isNewline) {
+            let fields = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
+            guard fields.contains(where: { String($0) == "Add" }),
+                  let serviceIndex = fields.firstIndex(where: {
+                      Self.normalizedServiceType(String($0)) == serviceType
+                  }),
+                  fields.count > serviceIndex + 1 else {
+                continue
+            }
+
+            let name = String(fields[serviceIndex + 1])
+                .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+            guard !name.isEmpty, seen.insert(name).inserted else { continue }
+            names.append(name)
+        }
+
+        return names
+    }
+
+    static func parseResolution(_ output: String) -> String? {
+        let marker = " can be reached at "
+        for line in output.split(whereSeparator: \.isNewline) {
+            guard let markerRange = line.range(of: marker) else { continue }
+            let endpoint = line[markerRange.upperBound...]
+                .split(whereSeparator: { $0 == " " || $0 == "\t" })
+                .first
+                .map(String.init) ?? ""
+            if ADBService.isValidEndpoint(endpoint) {
+                return endpoint
+            }
+        }
+        return nil
+    }
+
+    private static func normalizedServiceType(_ value: String) -> String {
+        value.trimmingCharacters(in: CharacterSet(charactersIn: "."))
+    }
+
+    private static func resolveExecutable(environment: [String: String]) -> URL? {
+        var candidates = [
+            URL(fileURLWithPath: "/usr/bin/dns-sd"),
+            URL(fileURLWithPath: "/usr/sbin/dns-sd")
+        ]
+        if let path = environment["PATH"] {
+            candidates.append(contentsOf: path.split(separator: ":").map {
+                URL(fileURLWithPath: String($0)).appendingPathComponent("dns-sd")
+            })
+        }
+        return candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0.path) })
+    }
+}
+
 final class ADBService: ADBClient, @unchecked Sendable {
     private enum Timeout {
         static let startServer: TimeInterval = 5
@@ -441,9 +562,15 @@ final class ADBService: ADBClient, @unchecked Sendable {
     }
 
     private let runner: CommandRunner
+    private let bonjour: any BonjourClient
 
-    init(executableURL: URL, environment: [String: String]) {
+    init(
+        executableURL: URL,
+        environment: [String: String],
+        bonjour: (any BonjourClient)? = nil
+    ) {
         self.runner = CommandRunner(executableURL: executableURL, environment: environment)
+        self.bonjour = bonjour ?? BonjourService(environment: environment)
     }
 
     func startServer() async -> CommandResult {
@@ -470,7 +597,11 @@ final class ADBService: ADBClient, @unchecked Sendable {
 
     func discover() async -> DiscoveryResult {
         let command = await runner.run(["mdns", "services"], timeout: Timeout.discovery)
-        return DiscoveryResult(devices: Self.parseMDNS(command.stdout), command: command)
+        let devices = Self.parseMDNS(command.stdout)
+        guard devices.isEmpty, command.succeeded else {
+            return DiscoveryResult(devices: devices, command: command)
+        }
+        return DiscoveryResult(devices: await bonjour.discover(), command: command)
     }
 
     static func parseMDNS(_ output: String) -> [DiscoveredDevice] {
@@ -507,7 +638,7 @@ final class ADBService: ADBClient, @unchecked Sendable {
         return message.replacingOccurrences(of: value, with: "<redacted>")
     }
 
-    private static func isValidEndpoint(_ endpoint: String) -> Bool {
+    fileprivate static func isValidEndpoint(_ endpoint: String) -> Bool {
         guard !endpoint.isEmpty, !endpoint.contains(where: \.isWhitespace) else {
             return false
         }

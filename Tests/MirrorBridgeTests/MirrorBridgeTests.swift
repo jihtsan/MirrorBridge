@@ -116,6 +116,20 @@ final class FakeScrcpy: ScrcpyClient, @unchecked Sendable {
     }
 }
 
+final class RecordingBonjour: BonjourClient, @unchecked Sendable {
+    let devices: [DiscoveredDevice]
+    private(set) var discoverCalls = 0
+
+    init(devices: [DiscoveredDevice] = []) {
+        self.devices = devices
+    }
+
+    func discover() async -> [DiscoveredDevice] {
+        discoverCalls += 1
+        return devices
+    }
+}
+
 final class SequenceToolLocator: ToolLocating {
     var paths: [ToolPaths]
     private(set) var calls = 0
@@ -250,6 +264,136 @@ final class MirrorBridgeTests: XCTestCase {
                 DiscoveredDevice(endpoint: "192.168.1.8:39877", serviceName: "tablet")
             ]
         )
+    }
+
+    func testADBDiscoveryFallsBackToBonjourWhenMDNSReturnsOnlyAHeading() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MirrorBridgeBonjourTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let adbScript = directory.appendingPathComponent("adb")
+        try """
+            #!/bin/sh
+            printf 'List of discovered mdns services\\n'
+            """.data(using: .utf8)!.write(to: adbScript)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: adbScript.path
+        )
+
+        let dnsSDScript = directory.appendingPathComponent("dns-sd")
+        try """
+            #!/bin/sh
+            if [ "$1" = "-B" ]; then
+                printf 'Timestamp     Add 2  local.  _adb-tls-connect._tcp.  adb-vivo\\n'
+            elif [ "$1" = "-L" ]; then
+                printf 'adb-vivo can be reached at Android.local.:42237 (interface 6)\\n'
+            fi
+            """.data(using: .utf8)!.write(to: dnsSDScript)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: dnsSDScript.path
+        )
+
+        let adb = ADBService(
+            executableURL: adbScript,
+            environment: ["PATH": directory.path],
+            bonjour: BonjourService(
+                executableURL: dnsSDScript,
+                environment: ["PATH": directory.path]
+            )
+        )
+        let result = await adb.discover()
+
+        XCTAssertTrue(result.command.succeeded)
+        XCTAssertEqual(
+            result.devices,
+            [DiscoveredDevice(endpoint: "Android.local.:42237", serviceName: "adb-vivo")]
+        )
+    }
+
+    func testBonjourBrowseParserKeepsAddedConnectServicesAndDropsDuplicates() {
+        let output = """
+        Browsing for _adb-tls-connect._tcp
+        Timestamp     A/R Flags if Domain                    Service Type              Instance Name
+        12:00:00.000  Add 2  6 local.                       _adb-tls-connect._tcp.      adb-vivo.
+        12:00:00.001  Add 2  6 local.                       _adb-tls-connect._tcp.      adb-vivo.
+        12:00:00.002  Remove 0 6 local.                     _adb-tls-connect._tcp.      adb-old.
+        12:00:00.003  Add 2  6 local.                       _other._tcp.               unrelated
+        """
+
+        XCTAssertEqual(BonjourService.parseBrowse(output), ["adb-vivo"])
+    }
+
+    func testBonjourResolutionParserExtractsValidHostAndPort() {
+        let output = """
+        Lookup adb-vivo._adb-tls-connect._tcp.local
+        adb-vivo._adb-tls-connect._tcp.local. can be reached at Android.local.:42237 (interface 6)
+        """
+
+        XCTAssertEqual(
+            BonjourService.parseResolution(output),
+            "Android.local.:42237"
+        )
+        XCTAssertNil(
+            BonjourService.parseResolution(
+                "adb-vivo can be reached at Android.local. (interface 6)"
+            )
+        )
+    }
+
+    func testADBDiscoveryDoesNotBrowseBonjourWhenADBMDNSFindsDevices() async throws {
+        let adbScript = try makeExecutableScript(
+            """
+            #!/bin/sh
+            printf 'pixel _adb-tls-connect._tcp 192.168.1.7:41231\\n'
+            """
+        )
+        defer { try? FileManager.default.removeItem(at: adbScript.deletingLastPathComponent()) }
+
+        let bonjour = RecordingBonjour(devices: [
+            DiscoveredDevice(endpoint: "192.168.1.8:41231", serviceName: "tablet")
+        ])
+        let adb = ADBService(
+            executableURL: adbScript,
+            environment: ["PATH": "/usr/bin:/bin"],
+            bonjour: bonjour
+        )
+
+        let result = await adb.discover()
+
+        XCTAssertEqual(
+            result.devices,
+            [DiscoveredDevice(endpoint: "192.168.1.7:41231", serviceName: "pixel")]
+        )
+        XCTAssertEqual(bonjour.discoverCalls, 0)
+    }
+
+    func testADBDiscoveryPreservesMDNSFailureWithoutBrowsingBonjour() async throws {
+        let adbScript = try makeExecutableScript(
+            """
+            #!/bin/sh
+            printf 'mdns unavailable\\n' >&2
+            exit 1
+            """
+        )
+        defer { try? FileManager.default.removeItem(at: adbScript.deletingLastPathComponent()) }
+
+        let bonjour = RecordingBonjour(devices: [
+            DiscoveredDevice(endpoint: "192.168.1.8:41231", serviceName: "tablet")
+        ])
+        let adb = ADBService(
+            executableURL: adbScript,
+            environment: ["PATH": "/usr/bin:/bin"],
+            bonjour: bonjour
+        )
+
+        let result = await adb.discover()
+
+        XCTAssertFalse(result.command.succeeded)
+        XCTAssertTrue(result.devices.isEmpty)
+        XCTAssertEqual(bonjour.discoverCalls, 0)
     }
 
     func testDiscoveryNoResultsAndCommandFailureHaveDifferentRecoveryStates() async {

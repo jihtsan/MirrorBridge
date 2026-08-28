@@ -10,7 +10,8 @@ This is a developer preview for a single Mac and one or more Android devices. Th
 supported end-to-end flow is:
 
 - Pair with `adb pair` using the address and pairing code shown on the phone.
-- Discover paired Wireless debugging devices with `adb mdns services`.
+- Discover paired Wireless debugging devices with `adb mdns services`, falling
+  back to the system Bonjour browser when ADB returns no service entries.
 - Connect to the current dynamic ADB endpoint with `adb connect`.
 - Start and stop an external scrcpy mirror window.
 - Stop and reconnect without pairing again.
@@ -93,8 +94,9 @@ ADB and scrcpy substitutes and does not claim vendor or device compatibility.
 ## Known compatibility scope
 
 - The code is intended for macOS 13 or later and uses the system `Process` API.
-- Wireless debugging discovery depends on the `adb mdns services` output format
-  and a network that permits mDNS and the device's dynamic ADB endpoint.
+- Wireless debugging discovery uses `adb mdns services` with a system Bonjour
+  fallback, and depends on a network that permits mDNS and the device's dynamic
+  ADB endpoint.
 - The checked-in build has only been exercised on the local supported build host;
   no Intel Mac, Android vendor, or scrcpy release matrix is claimed here.
 - Smart View/Miracast, embedded scrcpy transport, cloud relay, account systems,
